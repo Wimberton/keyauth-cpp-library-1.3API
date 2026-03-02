@@ -48,6 +48,10 @@ namespace KeyAuth {
 		void forgot(std::string username, std::string email);
 		void logout();
 		static std::string expiry_remaining(const std::string& expiry);
+		static constexpr const char* kSavePath = "test.json";
+		static constexpr int kInitFailSleepMs = 1500;
+		static constexpr int kBadInputSleepMs = 3000;
+		static constexpr int kCloseSleepMs = 5000;
 
 		class subscriptions_class {
 		public:
