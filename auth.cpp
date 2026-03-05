@@ -2028,6 +2028,21 @@ static bool is_loopback_ipv6(const in6_addr& addr)
     return std::memcmp(&addr, &loopback, sizeof(loopback)) == 0;
 }
 
+static bool ip_string_private_or_loopback(const std::string& ip)
+{
+    if (ip.empty())
+        return false;
+    sockaddr_in sa4{};
+    if (inet_pton(AF_INET, ip.c_str(), &sa4.sin_addr) == 1) {
+        return is_private_or_loopback_ipv4(sa4.sin_addr.s_addr);
+    }
+    sockaddr_in6 sa6{};
+    if (inet_pton(AF_INET6, ip.c_str(), &sa6.sin6_addr) == 1) {
+        return is_loopback_ipv6(sa6.sin6_addr);
+    }
+    return false;
+}
+
 static bool host_is_keyauth(const std::string& host_lower)
 {
     if (host_lower == "keyauth.win" || host_lower == "keyauth.cc" || host_lower == "api-worker.keyauth.win")
@@ -2793,6 +2808,10 @@ std::string KeyAuth::api::req(std::string data, const std::string& url) {
     curl_easy_setopt(curl, CURLOPT_PROTOCOLS, CURLPROTO_HTTPS);
     curl_easy_setopt(curl, CURLOPT_REDIR_PROTOCOLS, CURLPROTO_HTTPS);
     curl_easy_setopt(curl, CURLOPT_CERTINFO, 1L);
+    curl_easy_setopt(curl, CURLOPT_PROXY, "");
+#ifdef CURL_SSLVERSION_TLSv1_2
+    curl_easy_setopt(curl, CURLOPT_SSLVERSION, CURL_SSLVERSION_TLSv1_2);
+#endif
     curl_easy_setopt(curl, CURLOPT_NOPROXY, XorStr("keyauth.win").c_str());
     curl_easy_setopt(curl, CURLOPT_POSTFIELDS, data.c_str());
     curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, write_callback);
@@ -2820,6 +2839,44 @@ std::string KeyAuth::api::req(std::string data, const std::string& url) {
         if (req_headers) curl_slist_free_all(req_headers);
         curl_easy_cleanup(curl);
         error(errorMsg);
+    }
+
+    long ssl_verify = 0;
+    if (curl_easy_getinfo(curl, CURLINFO_SSL_VERIFYRESULT, &ssl_verify) == CURLE_OK) {
+        if (ssl_verify != 0) {
+            if (req_headers) curl_slist_free_all(req_headers);
+            curl_easy_cleanup(curl);
+            error(XorStr("SSL verify result failed."));
+        }
+    }
+
+    char* effective_url = nullptr;
+    if (curl_easy_getinfo(curl, CURLINFO_EFFECTIVE_URL, &effective_url) == CURLE_OK && effective_url) {
+        std::string eff_host = extract_host(effective_url);
+        std::string host_lower = host;
+        std::string eff_lower = eff_host;
+        std::transform(host_lower.begin(), host_lower.end(), host_lower.begin(),
+            [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+        std::transform(eff_lower.begin(), eff_lower.end(), eff_lower.begin(),
+            [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+        if (!eff_lower.empty() && eff_lower != host_lower) {
+            if (req_headers) curl_slist_free_all(req_headers);
+            curl_easy_cleanup(curl);
+            error(XorStr("effective url host mismatch."));
+        }
+    }
+
+    char* primary_ip = nullptr;
+    if (curl_easy_getinfo(curl, CURLINFO_PRIMARY_IP, &primary_ip) == CURLE_OK && primary_ip) {
+        std::string ip = primary_ip;
+        std::string host_lower = host;
+        std::transform(host_lower.begin(), host_lower.end(), host_lower.begin(),
+            [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+        if (host_is_keyauth(host_lower) && ip_string_private_or_loopback(ip)) {
+            if (req_headers) curl_slist_free_all(req_headers);
+            curl_easy_cleanup(curl);
+            error(XorStr("api host resolved to private or loopback ip."));
+        }
     }
 
     if (KeyAuth::api::debug) {
