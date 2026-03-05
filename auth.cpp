@@ -161,6 +161,9 @@ static const char* kCriticalImports[] = {
     "CryptVerifyMessageSignature",
 };
 static std::atomic<uint32_t> text_crc_baseline{ 0 };
+static std::array<uint8_t, 16> checkinit_prologue{};
+static std::atomic<bool> checkinit_ready{ false };
+static std::atomic<bool> watchdog_started{ false };
 
 static inline void secure_zero(std::string& value) noexcept
 {
@@ -202,8 +205,14 @@ void KeyAuth::api::init()
     }
     std::thread(runChecks).detach();
     snapshot_prologues();
+    snapshot_checkinit();
     seed = generate_random_number();
     std::atexit([]() { cleanUpSeedData(seed); });
+
+    if (!secrutiy_watchdog.exchange(true)) {
+     std::thread(security_watchdog).detach();
+    }
+
     CreateThread(0, 0, (LPTHREAD_START_ROUTINE)modify, 0, 0, 0);
 
     if (ownerid.length() != 10)
@@ -2453,6 +2462,23 @@ void snapshot_prologues()
     }
 }
 
+static void snapshot_checkinit()
+{
+    if (checkinit_ready.load())
+        return;
+    const auto p = reinterpret_cast<const uint8_t*>(reinterpret_cast<uintptr_t>(&checkInit));
+    std::memcpy(checkinit_prologue.data(), p, checkinit_prologue.size());
+    checkinit_ready.store(true);
+}
+
+static bool checkinit_ok()
+{
+    if (!checkinit_ready.load())
+        return true;
+    const auto p = reinterpret_cast<const uint8_t*>(reinterpret_cast<uintptr_t>(&checkInit));
+    return std::memcmp(checkinit_prologue.data(), p, checkinit_prologue.size()) == 0;
+}
+
 bool prologues_ok()
 {
     if (!prologues_ready.load())
@@ -3020,6 +3046,17 @@ void start_heartbeat(KeyAuth::api* instance)
     if (heartbeat_started.exchange(true))
         return;
     std::thread(heartbeat_thread, instance).detach();
+}
+
+static void security_watchdog()
+{
+    while (true) {
+        Sleep(15000);
+        if (!checkinit_ok()) {
+            error(XorStr("security watchdog detected tamper."))
+        }
+        checkInit();
+    }
 }
 
 void KeyAuth::api::setDebug(bool value) {
@@ -3630,6 +3667,11 @@ void checkInit() {
     if (!initialized) {
         error(XorStr("You need to run the KeyAuthApp.init(); function before any other KeyAuth functions"));
     }
+
+    if (!checkinit_ok()) {
+        error(XorStr("checkInit prologue modified."));
+    }
+
     // usage: call init() once at startup; checks run automatically after that -nigel
     const auto now = std::chrono::duration_cast<std::chrono::seconds>(
         std::chrono::system_clock::now().time_since_epoch()).count();
