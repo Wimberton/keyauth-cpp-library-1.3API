@@ -3107,7 +3107,7 @@ static uint32_t rolling_crc32(const uint8_t* data, size_t len, size_t window = 6
 			uint8_t b = data[i + j];
 			crc ^= b;
 			for (int k = 0; k < 8; ++k) {
-				uinit32_t mask = (crc & 1u) ? 0xFFFFFFFFu : 0u;
+				uint32_t mask = (crc & 1u) ? 0xFFFFFFFFu : 0u;
 				crc = (crc >> 1) ^ (0xEDB88320u & mask);
 			}
 		}
