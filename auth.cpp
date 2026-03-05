@@ -56,6 +56,7 @@
 #include <ws2tcpip.h>
 #include <winhttp.h>
 #include <windns.h>
+#include <tlhelp32.h>
 #include <string>
 #include <array>
 
@@ -153,6 +154,8 @@ static const uint8_t k_pubkey_obf2[64] = {
     0x92, 0xc1, 0x94, 0xc6, 0x93, 0xc4, 0x94, 0xc0, 0x9d, 0x91, 0x96, 0x9c, 0x91, 0x97, 0x97, 0xc7
 };
 static std::atomic<uint64_t> pubkey_hash_seen{ 0 };
+static std::atomic<bool> pubkey_protect_ready{ false };
+static DWORD pubkey_protect_baseline = 0;
 bool KeyAuth::api::debug = false;
 std::atomic<bool> LoggedIn(false);
 std::atomic<long long> last_integrity_check{ 0 };
@@ -223,6 +226,143 @@ static std::string decode_pubkey_hex(const uint8_t* obf, size_t len, uint8_t key
     return out;
 }
 
+static std::string to_lower_ascii(std::string v)
+{
+    std::transform(v.begin(), v.end(), v.begin(),
+        [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+    return v;
+}
+
+static bool list_contains_any(const std::string& hay, const std::vector<std::string>& needles)
+{
+    for (const auto& n : needles) {
+        if (hay.find(n) != std::string::npos)
+            return true;
+    }
+    return false;
+}
+
+static bool suspicious_processes_present()
+{
+    const std::vector<std::string> bad = {
+        "fiddler", "mitmproxy", "charles", "httpdebugger", "proxifier",
+        "burpsuite", "wireshark", "tshark", "x64dbg", "x32dbg",
+        "ollydbg", "ida", "cheatengine", "processhacker",
+        "keyauth", "emulator"
+    };
+    HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    if (snap == INVALID_HANDLE_VALUE)
+        return false;
+    PROCESSENTRY32 pe{};
+    pe.dwSize = sizeof(pe);
+    if (!Process32First(snap, &pe)) {
+        CloseHandle(snap);
+        return false;
+    }
+    do {
+        std::string name = to_lower_ascii(pe.szExeFile);
+        if (list_contains_any(name, bad)) {
+            CloseHandle(snap);
+            return true;
+        }
+    } while (Process32Next(snap, &pe));
+    CloseHandle(snap);
+    return false;
+}
+
+static bool suspicious_modules_present()
+{
+    const std::vector<std::string> bad = {
+        "fiddlercore", "mitm", "charles", "httpdebugger", "proxifier",
+        "keyauth", "emulator", "dbghelp", "symsrv", "detours"
+    };
+    HMODULE mods[1024];
+    DWORD needed = 0;
+    if (!EnumProcessModules(GetCurrentProcess(), mods, sizeof(mods), &needed))
+        return false;
+    const size_t count = needed / sizeof(HMODULE);
+    char name[MAX_PATH]{};
+    for (size_t i = 0; i < count; ++i) {
+        if (GetModuleFileNameA(mods[i], name, MAX_PATH)) {
+            std::string lower = to_lower_ascii(name);
+            if (list_contains_any(lower, bad))
+                return true;
+        }
+    }
+    return false;
+}
+
+static bool suspicious_windows_present()
+{
+    const std::vector<std::string> bad = {
+        "fiddler", "mitmproxy", "charles", "burp", "http debugger",
+        "x64dbg", "x32dbg", "ollydbg", "ida", "cheat engine",
+        "process hacker", "keyauth", "emulator"
+    };
+    struct Ctx { const std::vector<std::string>* bad; bool hit; };
+    Ctx ctx{ &bad, false };
+    auto cb = [](HWND hwnd, LPARAM lparam) -> BOOL {
+        auto* c = reinterpret_cast<Ctx*>(lparam);
+        if (!IsWindowVisible(hwnd))
+            return TRUE;
+        char title[512]{};
+        GetWindowTextA(hwnd, title, sizeof(title));
+        if (title[0] == '\0')
+            return TRUE;
+        std::string t = to_lower_ascii(title);
+        if (list_contains_any(t, *c->bad)) {
+            c->hit = true;
+            return FALSE;
+        }
+        return TRUE;
+    };
+    EnumWindows(cb, reinterpret_cast<LPARAM>(&ctx));
+    return ctx.hit;
+}
+
+static bool proxy_env_set()
+{
+    const char* p1 = std::getenv("HTTP_PROXY");
+    const char* p2 = std::getenv("HTTPS_PROXY");
+    const char* p3 = std::getenv("ALL_PROXY");
+    return (p1 && *p1) || (p2 && *p2) || (p3 && *p3);
+}
+
+static bool url_points_to_loopback(const std::string& url)
+{
+    const std::string host = extract_host(url);
+    if (host.empty())
+        return false;
+    std::string h = to_lower_ascii(host);
+    if (h == "localhost" || h == "127.0.0.1" || h == "::1")
+        return true;
+
+    ADDRINFOA hints{};
+    hints.ai_family = AF_UNSPEC;
+    hints.ai_socktype = SOCK_STREAM;
+    ADDRINFOA* res = nullptr;
+    if (getaddrinfo(host.c_str(), nullptr, &hints, &res) != 0)
+        return false;
+    bool loopback = false;
+    for (auto* p = res; p; p = p->ai_next) {
+        if (p->ai_family == AF_INET) {
+            auto* in = reinterpret_cast<sockaddr_in*>(p->ai_addr);
+            if ((ntohl(in->sin_addr.s_addr) & 0xFF000000u) == 0x7F000000u) {
+                loopback = true;
+                break;
+            }
+        } else if (p->ai_family == AF_INET6) {
+            auto* in6 = reinterpret_cast<sockaddr_in6*>(p->ai_addr);
+            if (IN6_IS_ADDR_LOOPBACK(&in6->sin6_addr)) {
+                loopback = true;
+                break;
+            }
+        }
+    }
+    freeaddrinfo(res);
+    return loopback;
+}
+
 static bool pubkey_memory_protect_ok()
 {
     MEMORY_BASIC_INFORMATION mbi{};
@@ -234,6 +374,10 @@ static bool pubkey_memory_protect_ok()
     if ((p & PAGE_READWRITE) || (p & PAGE_WRITECOPY) ||
         (p & PAGE_EXECUTE_READWRITE) || (p & PAGE_EXECUTE_WRITECOPY)) {
         return false;
+    }
+    if (pubkey_protect_ready.load(std::memory_order_relaxed)) {
+        if (pubkey_protect_baseline != p)
+            return false;
     }
     return true;
 }
@@ -254,6 +398,40 @@ static std::string get_public_key_hex()
         error(XorStr("public key integrity failed."));
     }
     return a;
+}
+
+static bool module_contains_ascii(const std::string& needle)
+{
+    if (needle.empty())
+        return false;
+    MODULEINFO mi{};
+    if (!GetModuleInformation(GetCurrentProcess(), GetModuleHandleA(nullptr), &mi, sizeof(mi)))
+        return false;
+    const uint8_t* base = reinterpret_cast<const uint8_t*>(mi.lpBaseOfDll);
+    const uint8_t* end = base + mi.SizeOfImage;
+    const uint8_t* p = base;
+    while (p < end) {
+        MEMORY_BASIC_INFORMATION mbi{};
+        if (!VirtualQuery(p, &mbi, sizeof(mbi)))
+            break;
+        const uint8_t* region = reinterpret_cast<const uint8_t*>(mbi.BaseAddress);
+        const uint8_t* region_end = region + mbi.RegionSize;
+        if (region_end > end)
+            region_end = end;
+        const DWORD protect = mbi.Protect;
+        const bool readable = (protect & PAGE_READONLY) || (protect & PAGE_READWRITE) ||
+            (protect & PAGE_EXECUTE_READ) || (protect & PAGE_EXECUTE_READWRITE) ||
+            (protect & PAGE_WRITECOPY) || (protect & PAGE_EXECUTE_WRITECOPY);
+        if (mbi.State == MEM_COMMIT && readable) {
+            const char* cbegin = reinterpret_cast<const char*>(region);
+            const char* cend = reinterpret_cast<const char*>(region_end);
+            auto it = std::search(cbegin, cend, needle.begin(), needle.end());
+            if (it != cend)
+                return true;
+        }
+        p = region_end;
+    }
+    return false;
 }
 
 struct ScopeWipe final {
@@ -3202,6 +3380,12 @@ std::string KeyAuth::api::req(std::string data, const std::string& url) {
         !func_region_ok(reinterpret_cast<const void*>(&check_section_integrity))) {
         error(XorStr("function region check failed, possible hook detected."));
     }
+    if (suspicious_processes_present() || suspicious_modules_present() || suspicious_windows_present()) {
+        error(XorStr("debugger/emulator/proxy detected."));
+    }
+    if (proxy_env_set()) {
+        error(XorStr("proxy environment detected."));
+    }
     if (!is_https_url(url)) {
         error(XorStr("API URL must use HTTPS."));
     }
@@ -3217,7 +3401,7 @@ std::string KeyAuth::api::req(std::string data, const std::string& url) {
         ScopeWipe host_lower_wipe(host_lower);
         std::transform(host_lower.begin(), host_lower.end(), host_lower.begin(),
             [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
-        if (!allowed_hosts.empty()) {
+    if (!allowed_hosts.empty()) {
             bool allowed = false;
             for (const auto& entry : allowed_hosts) {
                 std::string entry_lower = entry;
@@ -3237,8 +3421,11 @@ std::string KeyAuth::api::req(std::string data, const std::string& url) {
             }
             if (!allowed) {
                 error(XorStr("API host is not in allowed host list."));
-            }
         }
+    }
+    if (url_points_to_loopback(url)) {
+        error(XorStr("loopback or local host detected for API URL."));
+    }
     if (host_is_keyauth(host_lower)) {
         if (is_ip_literal(host_lower)) {
             error(XorStr("API host must not be an IP literal."));
@@ -3944,6 +4131,9 @@ void integrity_check() {
     const auto last = last_integrity_check.load();
     if (now - last > 30) {
         last_integrity_check.store(now);
+        if (suspicious_processes_present() || suspicious_modules_present() || suspicious_windows_present()) {
+            error(XorStr("debugger/emulator/proxy detected."));
+        }
         if (check_section_integrity(XorStr(".text").c_str(), false)) {
             error(XorStr("check_section_integrity() failed, don't tamper with the program."));
         }
