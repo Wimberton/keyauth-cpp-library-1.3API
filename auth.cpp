@@ -2332,17 +2332,46 @@ void KeyAuth::api::reset_lockout(lockout_state& state)
 
 int VerifyPayload(std::string signature, std::string timestamp, std::string body)
 {
+#if defined(_DEBUG)
+    auto dump_sig_debug = [&](const char* reason) {
+        char temp_path[MAX_PATH] = {};
+        char log_path[MAX_PATH] = {};
+        if (GetTempPathA(MAX_PATH, temp_path) == 0) {
+            strcpy_s(temp_path, ".\\");
+        }
+        sprintf_s(log_path, "%skeyauth_sig_debug.log", temp_path);
+        std::ofstream dbg(log_path, std::ios::out | std::ios::app);
+        if (!dbg.is_open()) {
+            return;
+        }
+        dbg << "reason=" << (reason ? reason : "unknown") << "\n";
+        dbg << "timestamp=" << timestamp << "\n";
+        dbg << "signature_len=" << signature.size() << "\n";
+        dbg << "signature=" << signature << "\n";
+        dbg << "body_len=" << body.size() << "\n";
+        dbg << "body=" << body << "\n";
+        dbg << "pubkey=" << get_public_key_hex() << "\n";
+        dbg << "----\n";
+    };
+#endif
+
     // disabled prologue checks. -nigel
     // if (!prologues_ok()) {
     //     error(XorStr("function prologue check failed, possible inline hook detected."));
     // }
     integrity_check();
     if (timestamp.size() < 10 || timestamp.size() > 13) {
+#if defined(_DEBUG)
+        dump_sig_debug("timestamp_length");
+#endif
         MessageBoxA(0, "Signature verification failed (timestamp length)", "KeyAuth", MB_ICONERROR);
         exit(2);
     }
     for (char c : timestamp) {
         if (c < '0' || c > '9') {
+#if defined(_DEBUG)
+            dump_sig_debug("timestamp_format");
+#endif
             MessageBoxA(0, "Signature verification failed (timestamp format)", "KeyAuth", MB_ICONERROR);
             exit(2);
         }
@@ -2353,6 +2382,9 @@ int VerifyPayload(std::string signature, std::string timestamp, std::string body
     }
     catch (...) {
         std::cerr << "[ERROR] Invalid timestamp format\n";
+#if defined(_DEBUG)
+        dump_sig_debug("invalid_timestamp");
+#endif
         MessageBoxA(0, "Signature verification failed (invalid timestamp)", "KeyAuth", MB_ICONERROR);
         exit(2);
     }
@@ -2365,12 +2397,18 @@ int VerifyPayload(std::string signature, std::string timestamp, std::string body
     if (diff > 120) {
         std::cerr << "[ERROR] Timestamp too skewed (diff = "
             << diff << "s)\n";
+#if defined(_DEBUG)
+        dump_sig_debug("timestamp_skew");
+#endif
         MessageBoxA(0, "Signature verification failed (timestamp skew)", "KeyAuth", MB_ICONERROR);
         exit(3);
     }
 
     if (sodium_init() < 0) {
         std::cerr << "[ERROR] Failed to initialize libsodium\n";
+#if defined(_DEBUG)
+        dump_sig_debug("libsodium_init");
+#endif
         MessageBoxA(0, "Signature verification failed (libsodium init)", "KeyAuth", MB_ICONERROR);
         exit(4);
     }
@@ -2381,11 +2419,17 @@ int VerifyPayload(std::string signature, std::string timestamp, std::string body
     unsigned char pk[32];
 
     if (signature.size() != 128) {
+#if defined(_DEBUG)
+        dump_sig_debug("signature_length");
+#endif
         MessageBoxA(0, "Signature verification failed (sig length)", "KeyAuth", MB_ICONERROR);
         exit(5);
     }
     if (sodium_hex2bin(sig, sizeof(sig), signature.c_str(), signature.length(), NULL, NULL, NULL) != 0) {
         std::cerr << "[ERROR] Failed to parse signature hex.\n";
+#if defined(_DEBUG)
+        dump_sig_debug("signature_hex_parse");
+#endif
         MessageBoxA(0, "Signature verification failed (invalid signature format)", "KeyAuth", MB_ICONERROR);
         exit(5);
     }
@@ -2393,6 +2437,9 @@ int VerifyPayload(std::string signature, std::string timestamp, std::string body
     const std::string pubkey_hex = get_public_key_hex();
     if (sodium_hex2bin(pk, sizeof(pk), pubkey_hex.c_str(), pubkey_hex.length(), NULL, NULL, NULL) != 0) {
         std::cerr << "[ERROR] Failed to parse public key hex.\n";
+#if defined(_DEBUG)
+        dump_sig_debug("public_key_parse");
+#endif
         MessageBoxA(0, "Signature verification failed (invalid public key)", "KeyAuth", MB_ICONERROR);
         exit(6);
     }
@@ -2409,6 +2456,9 @@ int VerifyPayload(std::string signature, std::string timestamp, std::string body
         pk) != 0)
     {
         std::cerr << "[ERROR] Signature verification failed.\n";
+#if defined(_DEBUG)
+        dump_sig_debug("invalid_signature");
+#endif
         MessageBoxA(0, "Signature verification failed (invalid signature)", "KeyAuth", MB_ICONERROR);
         exit(7);
     }
